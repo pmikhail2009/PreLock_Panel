@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="ru"><meta charset="utf-8"><meta name="referrer" content="no-referrer"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><title>PreLock Panel</title>
+<script>
+/* Shared between the Panorama UI and the local store. No engine dependencies. */
+var TelelockRosterCore = (function () {
+    'use strict';
+    function normalize(value) {
+        if (!value || value.version !== 1 || typeof value.random !== 'boolean' || !Array.isArray(value.heroes) || value.heroes.length > 80)
+            throw new Error('Некорректный формат набора');
+        var seen = {}, heroes = value.heroes.map(function (hero) {
+            if (!hero || !Number.isInteger(hero.id) || hero.id <= 0 || hero.id > 10000 || seen[hero.id] ||
+                [-1, 0, 1, 2].indexOf(hero.priority) < 0) throw new Error('Некорректный герой или повтор ID');
+            seen[hero.id] = true;
+            return { id: hero.id, priority: hero.priority };
+        }).sort(function (a, b) { return a.id - b.id; });
+        if (!value.random && !heroes.some(function (hero) { return hero.priority >= 0; }))
+            throw new Error('Выберите хотя бы одного героя');
+        return { version: 1, random: value.random, heroes: heroes };
+    }
+    function name(value) {
+        if (typeof value !== 'string') throw new Error('Введите название');
+        value = value.trim();
+        if (!value || value.length > 32 || /[\x00-\x1f\x7f]/.test(value)) throw new Error('Название: от 1 до 32 символов');
+        return value;
+    }
+    function equal(a, b) { return JSON.stringify(normalize(a)) === JSON.stringify(normalize(b)); }
+    // -2 = unselected, -1 = avoided, 0 = selected, 1 = priority, 2 = high priority.
+    // Add desired heroes before clearing old ones. Read real classes after each action.
+    function next(states, target, random) {
+        target = normalize(target);
+        var desired = {}, ids = Object.keys(states).map(Number).sort(function (a,b) { return a-b; });
+        target.heroes.forEach(function (h) {
+            if (!Object.prototype.hasOwnProperty.call(states, h.id)) throw new Error('Герой '+h.id+' отсутствует на этом экране');
+            desired[h.id] = h.priority;
+        });
+        if (random) {
+            var same=ids.every(function(id) {return states[id] === (Object.prototype.hasOwnProperty.call(desired,id)?desired[id]:-2);});
+            if (target.random && same) return null;
+            return { kind: 'random' };
+        }
+        for (var i=0;i<ids.length;i++) {
+            var id=ids[i], want=desired[id], have=states[id];
+            if (want >= 0 && have < 0) return { id:id, kind:have === -1 ? 'ban' : 'select' };
+        }
+        for (var j=0;j<ids.length;j++) {
+            var hero=ids[j], wanted=Object.prototype.hasOwnProperty.call(desired,hero) ? desired[hero] : -2, current=states[hero];
+            if (wanted === current) continue;
+            if (current === -1) return { id:hero, kind:'ban' };
+            if (wanted < 0 && current >= 0) return { id:hero, kind:'select' };
+            if (wanted === -1) return { id:hero, kind:'ban' };
+            if (current >= 0 && wanted >= 0) return { id:hero, kind:'priority' };
+        }
+        return target.random ? { kind:'random' } : null;
+    }
+    return { normalize:normalize, name:name, equal:equal, next:next };
+})();
+if (typeof module !== 'undefined' && module.exports) module.exports = TelelockRosterCore;
+
+</script>
+<script>
+/* Runs in CEF. Presets never leave this browser profile. */
+var TelelockRosterBrowserStore = (function () {
+    'use strict';
+    function create(storage, core, uuid) {
+        var key='prelock_roster_presets_v1';
+        function read() {
+            var raw;
+            try {raw=storage.getItem(key);} catch(e) {throw Error('Хранилище Chromium недоступно');}
+            if(raw===null) return {version:1,presets:[]};
+            var data;
+            try {data=JSON.parse(raw);} catch(e) {throw Error('Файл пресетов повреждён; сохранённые данные не изменены');}
+            if(!data || data.version!==1 || !Array.isArray(data.presets) || data.presets.length>32) throw Error('Неизвестный формат пресетов; данные не изменены');
+            var seen={};
+            data.presets=data.presets.map(function(p) {
+                if(!p || typeof p.id!=='string' || !/^[a-f0-9-]{36}$/.test(p.id) || seen[p.id]) throw Error('Повреждён ID пресета');
+                seen[p.id]=true;
+                return {id:p.id,name:core.name(p.name),snapshot:core.normalize(p.snapshot)};
+            });
+            return data;
+        }
+        function execute(action,body) {
+            body=body||{};
+            var data=read(),record,index;
+            if(action==='list') return data.presets.map(function(p) {return {id:p.id,name:p.name,count:p.snapshot.heroes.filter(function(h){return h.priority>=0;}).length,random:p.snapshot.random};});
+            if(action==='get') {
+                record=data.presets.filter(function(p){return p.id===body.id;})[0];
+                if(!record) throw Error('Пресет не найден');
+                return record;
+            }
+            if(action==='create') {
+                if(data.presets.length>=32) throw Error('Можно сохранить не более 32 пресетов');
+                var name=core.name(body.name);
+                if(data.presets.some(function(p){return p.name.toLocaleLowerCase()===name.toLocaleLowerCase();})) throw Error('Такое название уже есть');
+                record={id:uuid(),name:name,snapshot:core.normalize(body.snapshot)};
+                data.presets.push(record);
+            } else if(action==='delete') {
+                index=data.presets.map(function(p){return p.id;}).indexOf(body.id);
+                if(index<0) throw Error('Пресет не найден');
+                data.presets.splice(index,1);
+            } else throw Error('Неизвестное действие');
+            // Acknowledgement means localStorage accepted the durable write.
+            // Never pretend an in-memory fallback is a persistent save.
+            try {
+                var previous=storage.getItem(key);
+                if(previous!==null) storage.setItem(key+'_backup',previous);
+                storage.setItem(key,JSON.stringify(data));
+            } catch(e) {throw Error('Не удалось сохранить пресет на этом ПК');}
+            return {saved:true,id:record?record.id:body.id};
+        }
+        return {execute:execute,key:key};
+    }
+    return {create:create};
+})();
+if(typeof module!=='undefined' && module.exports) module.exports=TelelockRosterBrowserStore;
+
+</script>
+<script>
+(function () {
+    'use strict';
+    var session=new URLSearchParams(location.search).get('session');
+    if(!/^[a-z0-9-]{1,80}$/.test(session||''))return;
+    var current=null,outgoing=null,completed=null;
+    function uuid() {
+        if(typeof crypto!=='undefined' && crypto.randomUUID)return crypto.randomUUID();
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,function(c){var r=Math.floor(Math.random()*16);return(c==='x'?r:(r&3)|8).toString(16);});
+    }
+    // Access can itself throw when CEF denies storage. Report it on the request.
+    var store;
+    function storage() {
+        if(!store)store=TelelockRosterBrowserStore.create(window.localStorage,TelelockRosterCore,uuid);
+        return store;
+    }
+    function title(value) {document.title='rp2:'+session+':'+value;}
+    function responsePart(index) {
+        title('res:'+outgoing.id+':'+index+':'+outgoing.parts.length+':'+outgoing.parts[index]);
+    }
+    function respond(id,payload) {
+        var text=encodeURIComponent(JSON.stringify(payload)),parts=[];
+        for(var i=0;i<text.length;i+=1400)parts.push(text.slice(i,i+1400));
+        outgoing={id:id,parts:parts};completed={id:id,payload:payload};responsePart(0);
+    }
+    function receive() {
+        var hash=location.hash.slice(1),ack=/^rp2ack:(\d+):(\d+)$/.exec(hash);
+        if(ack) {var index=Number(ack[2]);if(outgoing&&outgoing.id===Number(ack[1])&&index+1<outgoing.parts.length)responsePart(index+1);return;}
+        var match=/^rp2:(\d+):(\d+):(\d+):([\s\S]*)$/.exec(hash);
+        if(!match)return;
+        var id=Number(match[1]),part=Number(match[2]),total=Number(match[3]);
+        if(!Number.isSafeInteger(id)||id<=0||total<1||total>72||part>=total||match[4].length>1400)return;
+        if(completed&&completed.id===id) {respond(id,completed.payload);return;}
+        if(!current || current.id!==id) {if(part!==0)return;current={id:id,total:total,parts:[]};}
+        if(current.total!==total)return;
+        if(part<current.parts.length) {title('ack:'+id+':'+part);return;}
+        if(part!==current.parts.length)return;
+        current.parts.push(match[4]);
+        if(current.parts.length<total) {title('ack:'+id+':'+part);return;}
+        try {
+            var request=JSON.parse(decodeURIComponent(current.parts.join('')));
+            if(request.id!==id)throw Error('Некорректный запрос');
+            respond(id,{ok:true,result:storage().execute(request.action,request.body)});
+        } catch(error) {respond(id,{ok:false,error:String(error.message||error)});}
+        current=null;
+    }
+    window.addEventListener('hashchange',receive);
+    title('ready');
+    if(location.hash)receive();
+})();
+
+</script>
+</html>
