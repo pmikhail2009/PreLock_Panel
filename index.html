@@ -62,7 +62,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = TelelockRo
 var TelelockRosterBrowserStore = (function () {
     'use strict';
     function create(storage, core, uuid) {
-        var key='prelock_roster_presets_v1';
+        var key='prelock_roster_presets_v1',preferencesKey='prelock_roster_preferences_v1';
         function read() {
             var raw;
             try {raw=storage.getItem(key);} catch(e) {throw Error('Хранилище Chromium недоступно');}
@@ -80,6 +80,21 @@ var TelelockRosterBrowserStore = (function () {
         }
         function execute(action,body) {
             body=body||{};
+            if(action==='preferences_get') {
+                var rawPreferences;
+                try {rawPreferences=storage.getItem(preferencesKey);}catch(e){throw Error('Хранилище Chromium недоступно');}
+                if(rawPreferences===null)return {locale:'en'};
+                var preferences;
+                try {preferences=JSON.parse(rawPreferences);}catch(e){throw Error('Настройки интерфейса повреждены');}
+                if(!preferences||preferences.version!==1||['en','ru'].indexOf(preferences.locale)<0)throw Error('Настройки интерфейса повреждены');
+                return {locale:preferences.locale};
+            }
+            if(action==='preferences_set') {
+                if(['en','ru'].indexOf(body.locale)<0)throw Error('Некорректный язык интерфейса');
+                try {storage.setItem(preferencesKey,JSON.stringify({version:1,locale:body.locale}));}
+                catch(e){throw Error('Не удалось сохранить язык интерфейса');}
+                return {saved:true,locale:body.locale};
+            }
             var data=read(),record,index;
             if(action==='list') return data.presets.map(function(p) {return {id:p.id,name:p.name,count:p.snapshot.heroes.filter(function(h){return h.priority>=0;}).length,random:p.snapshot.random};});
             if(action==='get') {
